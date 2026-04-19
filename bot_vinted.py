@@ -91,6 +91,9 @@ class VintedItemView(ui.View):
         ))
 
 class VintedBot(discord.Client):
+    # Number of scan cycles to skip a channel after a permission error before retrying.
+    PERMISSION_SKIP_CYCLES = 10
+
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
@@ -98,6 +101,29 @@ class VintedBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.scraper = VintedScraper()
         self.db = None
+        # Maps channel_id -> remaining cycles to skip due to a permission error.
+        self._permission_errors: dict[int, int] = {}
+
+    def _check_send_permissions(self, channel: discord.TextChannel) -> bool:
+        """Return True if the bot has Send Messages + Embed Links in *channel*."""
+        me = channel.guild.me
+        perms = channel.permissions_for(me)
+        if not perms.send_messages:
+            logging.warning(
+                f"⚠️  Permission manquante : 'Envoyer des messages' dans #{channel.name} "
+                f"(id={channel.id}, serveur='{channel.guild.name}'). "
+                "Ajoutez la permission ou retirez le filtre avec /vinted_clear."
+            )
+            return False
+        if not perms.embed_links:
+            logging.warning(
+                f"⚠️  Permission manquante : 'Intégrer des liens' dans #{channel.name} "
+                f"(id={channel.id}, serveur='{channel.guild.name}'). "
+                "Ajoutez la permission ou retirez le filtre avec /vinted_clear."
+            )
+            return False
+        return True
+
 
     async def setup_hook(self):
         self.db = await aiosqlite.connect(DB_NAME)
@@ -131,11 +157,35 @@ class VintedBot(discord.Client):
                 filters = await cursor.fetchall()
 
             for channel_id, url, name in filters:
+                # --- BACKOFF : skip channels that recently raised a 403 ---
+                if channel_id in self._permission_errors:
+                    remaining = self._permission_errors[channel_id] - 1
+                    if remaining > 0:
+                        self._permission_errors[channel_id] = remaining
+                        logging.debug(
+                            f"⏭️  Salon {channel_id} ignoré ({remaining} cycle(s) restant(s) "
+                            "avant nouvelle tentative suite à une erreur de permission)."
+                        )
+                        continue
+                    else:
+                        del self._permission_errors[channel_id]
+                        logging.info(
+                            f"🔄 Nouvelle tentative pour le salon {channel_id} "
+                            "après la période de cooldown."
+                        )
+
                 items = await self.scraper.fetch_items(url)
                 channel = self.get_channel(channel_id)
-                
+
                 if not channel or not items:
                     continue
+
+                # --- VÉRIFICATION DES PERMISSIONS AVANT ENVOI ---
+                if not self._check_send_permissions(channel):
+                    self._permission_errors[channel_id] = self.PERMISSION_SKIP_CYCLES
+                    continue
+
+
 
                 for item in items[:15]:
                     item_id = item.get('id')
@@ -237,9 +287,21 @@ class VintedBot(discord.Client):
 
                     try:
                         await channel.send(embed=embed, view=view)
-                    except Exception as e:
-                        logging.error(f"Erreur Discord API: {e}")
-                    
+                    except discord.Forbidden:
+                        logging.error(
+                            f"🚫 403 Forbidden dans #{channel.name} (id={channel.id}, "
+                            f"serveur='{channel.guild.name}'): permissions manquantes. "
+                            f"Ce salon sera ignoré pendant {self.PERMISSION_SKIP_CYCLES} "
+                            "cycles. Corrigez les permissions ou supprimez le filtre avec /vinted_clear."
+                        )
+                        self._permission_errors[channel_id] = self.PERMISSION_SKIP_CYCLES
+                        break  # stop processing items for this channel
+                    except discord.HTTPException as e:
+                        logging.error(
+                            f"⚠️  Erreur HTTP Discord dans #{channel.name} "
+                            f"(status={e.status}, code={e.code}): {e.text}"
+                        )
+
                     await asyncio.sleep(0.5)
 
         except Exception as e:
@@ -272,6 +334,36 @@ async def clear_filters(interaction: discord.Interaction):
     await bot.db.execute("DELETE FROM filters WHERE channel_id = ?", (interaction.channel_id,))
     await bot.db.commit()
     await interaction.response.send_message("🗑️ Tous les filtres de ce salon ont été supprimés.")
+
+@bot.tree.command(name="vinted_check_permissions", description="Vérifier les permissions du bot dans ce salon")
+async def check_permissions(interaction: discord.Interaction):
+    channel = interaction.channel
+    me = channel.guild.me
+    perms = channel.permissions_for(me)
+
+    missing = []
+    if not perms.send_messages:
+        missing.append("❌ **Envoyer des messages** — requis pour poster les annonces")
+    if not perms.embed_links:
+        missing.append("❌ **Intégrer des liens** — requis pour afficher les embeds")
+    if not perms.attach_files:
+        missing.append("⚠️  **Joindre des fichiers** — recommandé")
+    if not perms.read_message_history:
+        missing.append("⚠️  **Voir l'historique** — recommandé")
+
+    if not missing:
+        await interaction.response.send_message(
+            f"✅ Le bot dispose de toutes les permissions nécessaires dans **#{channel.name}**.",
+            ephemeral=True
+        )
+    else:
+        lines = "\n".join(missing)
+        await interaction.response.send_message(
+            f"⚠️  Permissions manquantes dans **#{channel.name}** :\n{lines}\n\n"
+            "Corrigez ces permissions dans les paramètres du salon, puis relancez cette commande pour vérifier.",
+            ephemeral=True
+        )
+
 
 if __name__ == "__main__":
     if TOKEN:
