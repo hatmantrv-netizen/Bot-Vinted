@@ -11,7 +11,7 @@ import os
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TOKEN")
 CHECK_INTERVAL = 30  # Secondes entre chaque scan
-DB_NAME = "vinted_bot_v2.db"
+DB_NAME = "/app/data/vinted_bot_v2.db"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
