@@ -7,16 +7,18 @@ from discord.ext import tasks
 import logging
 from datetime import datetime
 import os
+from dotenv import load_dotenv
 
-# --- CONFIGURATION ---
+# --- INITIALISATION & CONFIGURATION ---
+load_dotenv()
 TOKEN = os.getenv("TOKEN")
-CHECK_INTERVAL = 30  # Secondes entre chaque scan
+CHECK_INTERVAL = 30  
 DB_NAME = "vinted_bot_v2.db"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 if TOKEN is None:
-    logging.error("❌ La variable d'environnement 'TOKEN' n'est pas définie dans ton système !")
+    logging.error("❌ TOKEN introuvable ! Vérifie ton fichier .env ou tes variables Railway.")
 
 class VintedScraper:
     def __init__(self):
@@ -31,64 +33,42 @@ class VintedScraper:
 
     async def _get_session(self):
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(headers=self.headers)
+            self.session = aiohttp.ClientSession(headers=self.headers, timeout=aiohttp.ClientTimeout(total=15))
         return self.session
 
     async def fetch_cookies(self):
-        """Initialise la session et récupère les cookies nécessaires"""
         try:
             session = await self._get_session()
             async with session.get("https://www.vinted.fr/") as resp:
                 self.cookies = resp.cookies
-                logging.info("Initialisation réussie : Nouveaux cookies Vinted récupérés.")
+                logging.info("🍪 Cookies Vinted actualisés.")
         except Exception as e:
-            logging.error(f"Erreur d'initialisation (cookies): {e}")
+            logging.error(f"Erreur cookies : {e}")
 
     async def fetch_items(self, url):
-        """Récupère les items en convertissant l'URL en appel API"""
-        if self.cookies is None:
-            await self.fetch_cookies()
-
+        if self.cookies is None: await self.fetch_cookies()
         session = await self._get_session()
         
-        if "api/v2/catalog/items" not in url:
-            api_url = url.replace("vinted.fr/catalog", "vinted.fr/api/v2/catalog/items")
-        else:
-            api_url = url
+        api_url = url.replace("vinted.fr/catalog", "vinted.fr/api/v2/catalog/items") if "api/v2" not in url else url
 
         try:
             async with session.get(api_url, cookies=self.cookies) as resp:
                 if resp.status in [401, 403]:
-                    logging.warning(f"Accès refusé ({resp.status}), rafraîchissement des cookies...")
                     await self.fetch_cookies()
                     return []
-                
                 if resp.status == 200:
                     data = await resp.json()
                     return data.get('items', [])
-                
-                logging.error(f"Vinted API Error: Status {resp.status}")
                 return []
-        except Exception as e:
-            logging.error(f"Erreur réseau lors de la requête : {e}")
+        except Exception:
             return []
 
-# --- BOUTONS SOUS L'ARTICLE ---
+# --- INTERFACE (BOUTONS) ---
 class VintedItemView(ui.View):
     def __init__(self, item_url, negotiate_url):
         super().__init__(timeout=None)
-        
-        self.add_item(ui.Button(
-            label="🔍 Voir détails", 
-            style=discord.ButtonStyle.link, 
-            url=item_url
-        ))
-        
-        self.add_item(ui.Button(
-            label="💬 Négocier", 
-            style=discord.ButtonStyle.link, 
-            url=negotiate_url
-        ))
+        self.add_item(ui.Button(label="🔍 Voir détails", style=discord.ButtonStyle.link, url=item_url))
+        self.add_item(ui.Button(label="💬 Négocier", style=discord.ButtonStyle.link, url=negotiate_url))
 
 class VintedBot(discord.Client):
     def __init__(self):
@@ -101,27 +81,14 @@ class VintedBot(discord.Client):
 
     async def setup_hook(self):
         self.db = await aiosqlite.connect(DB_NAME)
-        await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS filters (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id INTEGER,
-                user_id INTEGER,
-                url TEXT,
-                name TEXT
-            )
-        """)
-        await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS seen_items (
-                item_id INTEGER PRIMARY KEY,
-                timestamp DATETIME
-            )
-        """)
+        await self.db.execute("CREATE TABLE IF NOT EXISTS filters (id INTEGER PRIMARY KEY, channel_id INTEGER, user_id INTEGER, url TEXT, name TEXT)")
+        await self.db.execute("CREATE TABLE IF NOT EXISTS seen_items (item_id INTEGER PRIMARY KEY, timestamp DATETIME)")
         await self.db.commit()
         self.scan_vinted.start()
 
     async def on_ready(self):
         await self.tree.sync()
-        logging.info(f"✅ Bot connecté : {self.user}")
+        logging.info(f"✅ Bot prêt : {self.user}")
         await self.scraper.fetch_cookies()
 
     @tasks.loop(seconds=CHECK_INTERVAL)
@@ -133,148 +100,83 @@ class VintedBot(discord.Client):
             for channel_id, url, name in filters:
                 items = await self.scraper.fetch_items(url)
                 channel = self.get_channel(channel_id)
-                
-                if not channel or not items:
-                    continue
+                if not channel or not items: continue
 
                 for item in items[:15]:
                     item_id = item.get('id')
-                    if not item_id: continue
-                    
-                    # Vérification doublon
                     async with self.db.execute("SELECT 1 FROM seen_items WHERE item_id = ?", (item_id,)) as c:
-                        if await c.fetchone():
-                            continue
+                        if await c.fetchone(): continue
 
-                    await self.db.execute("INSERT INTO seen_items (item_id, timestamp) VALUES (?, ?)", 
-                                         (item_id, datetime.now()))
+                    await self.db.execute("INSERT INTO seen_items (item_id, timestamp) VALUES (?, ?)", (item_id, datetime.now()))
                     await self.db.commit()
 
-                    # --- EXTRACTION SÉCURISÉE DES DONNÉES ---
-                    title = item.get('title', 'Sans titre')
-                    
-                    # 1. Calcul du prix TTC (Frais Vinted = 0.70€ + 5% du prix)
-                    price_info = item.get('price', {})
-                    formatted_price = "0.00"
-                    raw_currency = "EUR"
-                    
-                    if isinstance(price_info, dict):
-                        formatted_price = price_info.get('amount', '0.00')
-                        raw_currency = price_info.get('currency_code', 'EUR')
-                    
+                    # --- EXTRACTION & CALCULS ---
+                    # 1. Temps écoulé
+                    published_at = "À l'instant"
+                    ts = item.get('created_at_ts') or item.get('updated_at_ts')
+                    if ts:
+                        diff = int(datetime.now().timestamp() - float(ts))
+                        if diff < 60: published_at = "À l'instant"
+                        elif diff < 3600: published_at = f"il y a {diff // 60} min"
+                        else: published_at = f"il y a {diff // 3600} h"
+
+                    # 2. Avis Vendeur
+                    user = item.get('user', {})
+                    rating = user.get('rating') or 0
+                    f_count = user.get('feedback_count', 0)
+                    stars = "⭐" * int(round(float(rating))) if f_count > 0 else "Nouveau"
+                    avis_txt = f"{stars} ({f_count})"
+
+                    # 3. Prix & TTC (0.70€ + 5%)
+                    price_val = item.get('price', {}).get('amount', '0.00')
+                    currency = item.get('price', {}).get('currency_code', '€')
                     try:
-                        base_price = float(formatted_price)
-                        # Formule officielle approximative des frais Vinted
-                        frais_protection = 0.70 + (base_price * 0.05)
-                        ttc_price = base_price + frais_protection
-                        price_display = f"{base_price:.2f} {raw_currency} | ≈ {ttc_price:.2f} {raw_currency} (TTC)"
-                    except (ValueError, TypeError):
-                        price_display = f"{formatted_price} {raw_currency}"
+                        p = float(price_val)
+                        ttc = p + 0.70 + (p * 0.05)
+                        price_txt = f"**{p:.2f} {currency}**\n*(TTC: {ttc:.2f} {currency})*"
+                    except: price_txt = f"**{price_val} {currency}**"
 
-                    # 2. Temps écoulé depuis la publication
-                    published_at = "Récemment"
-                    # Vinted fournit souvent la date sous forme de timestamp en secondes
-                    created_ts = item.get('created_at_ts') or item.get('updated_at_ts')
-                    if created_ts:
-                        now_ts = datetime.now().timestamp()
-                        diff_sec = now_ts - float(created_ts)
-                        diff_min = int(diff_sec // 60)
-                        
-                        if diff_min < 1:
-                            published_at = "À l'instant"
-                        elif diff_min < 60:
-                            published_at = f"il y a {diff_min} minute(s)"
-                        else:
-                            published_at = f"il y a {diff_min // 60} heure(s)"
-
-                    # 3. Récupération des avis du vendeur
-                    user_info = item.get('user', {})
-                    feedback_count = user_info.get('feedback_count', 0)
-                    # Vinted donne parfois une note sur 5 ou une réputation de 0 à 1
-                    rating = user_info.get('rating') or 0
-                    
-                    # Génération visuelle des étoiles
-                    stars_full = int(rating) if rating <= 5 else 0
-                    stars_empty = 5 - stars_full
-                    avis_display = f"{'⭐' * stars_full}{'☆' * stars_empty} ({feedback_count})" if feedback_count > 0 else "Pas d'avis"
-
-                    # Autres informations classiques
-                    brand = item.get('brand_title', 'Inconnue')
-                    size = item.get('size_title', 'N/A')
-                    condition = item.get('status_title') or item.get('status') or 'Non spécifié'
-                    photo = item.get('photo', {}).get('url')
-                    
-                    item_url = f"https://www.vinted.fr/items/{item_id}"
-                    negotiate_url = f"https://www.vinted.fr/messages/new?item_id={item_id}"
-
-                    # --- CRÉATION DE L'EMBED (DESIGN GRILLE 3x2) ---
-                    embed = discord.Embed(
-                        title=title,
-                        url=item_url,
-                        color=0x09B0B0,
-                        timestamp=datetime.now()
-                    )
-                    
-                    # Ligne 1 : Publié / Marque / Taille
+                    # --- CONSTRUCTION EMBED ---
+                    embed = discord.Embed(title=item.get('title'), url=f"https://www.vinted.fr/items/{item_id}", color=0x09B0B0, timestamp=datetime.now())
                     embed.add_field(name="⌛ Publié", value=published_at, inline=True)
-                    embed.add_field(name="📕 Marque", value=brand, inline=True)
-                    embed.add_field(name="📏 Taille", value=size, inline=True)
+                    embed.add_field(name="📕 Marque", value=item.get('brand_title', 'N/A'), inline=True)
+                    embed.add_field(name="📏 Taille", value=item.get('size_title', 'N/A'), inline=True)
+                    embed.add_field(name="💥 Avis", value=avis_txt, inline=True)
+                    embed.add_field(name="💎 État", value=item.get('status_title', 'N/A'), inline=True)
+                    embed.add_field(name="💰 Prix", value=price_txt, inline=True)
                     
-                    # Ligne 2 : Avis / État / Prix
-                    embed.add_field(name="💥 Avis", value=avis_display, inline=True)
-                    embed.add_field(name="💎 État", value=condition, inline=True)
-                    embed.add_field(name="💰 Prix", value=price_display, inline=True)
+                    if item.get('photo', {}).get('url'):
+                        embed.set_image(url=item['photo']['url'])
                     
-                    if photo:
-                        embed.set_image(url=photo)
-                        
-                    # Personnalisation du haut (Vendeur) et du bas
-                    seller_name = user_info.get('login', 'Inconnu')
-                    embed.set_author(name=f"Vendeur : {seller_name}")
-                    embed.set_footer(text=f"Filtre actif : {name} • Vintra")
+                    embed.set_author(name=f"Vendeur : {user.get('login', 'Inconnu')}")
+                    embed.set_footer(text=f"Filtre : {name}") # "Vintra" supprimé ici
 
-                    view = VintedItemView(item_url, negotiate_url)
-
-                    try:
-                        await channel.send(embed=embed, view=view)
-                    except Exception as e:
-                        logging.error(f"Erreur Discord API: {e}")
-                    
+                    view = VintedItemView(f"https://www.vinted.fr/items/{item_id}", f"https://www.vinted.fr/messages/new?item_id={item_id}")
+                    await channel.send(embed=embed, view=view)
                     await asyncio.sleep(0.5)
 
         except Exception as e:
-            logging.error(f"Erreur critique boucle de scan : {e}")
+            logging.error(f"Erreur boucle : {e}")
 
-# --- COMMANDES SLASH ---
+# --- COMMANDES ---
 bot = VintedBot()
 
-@bot.tree.command(name="vinted_add", description="Ajouter une recherche Vinted à surveiller")
+@bot.tree.command(name="vinted_add", description="Ajouter un filtre")
 async def add_filter(interaction: discord.Interaction, nom_du_filtre: str, url_vinted: str):
     if "vinted.fr" not in url_vinted:
-        await interaction.response.send_message("❌ URL Vinted invalide.", ephemeral=True)
-        return
-    
+        return await interaction.response.send_message("❌ URL invalide", ephemeral=True)
     if "order=newest_first" not in url_vinted:
-        separator = "&" if "?" in url_vinted else "?"
-        url_vinted += f"{separator}order=newest_first"
-
-    await bot.db.execute("INSERT INTO filters (channel_id, user_id, url, name) VALUES (?, ?, ?, ?)",
-                        (interaction.channel_id, interaction.user.id, url_vinted, nom_du_filtre))
+        url_vinted += ("&" if "?" in url_vinted else "?") + "order=newest_first"
+    
+    await bot.db.execute("INSERT INTO filters (channel_id, user_id, url, name) VALUES (?, ?, ?, ?)", (interaction.channel_id, interaction.user.id, url_vinted, nom_du_filtre))
     await bot.db.commit()
-    await interaction.response.send_message(f"✅ Filtre '**{nom_du_filtre}**' activé dans ce salon !", ephemeral=False)
+    await interaction.response.send_message(f"✅ Filtre '**{nom_du_filtre}**' ajouté !")
 
-@bot.tree.command(name="vinted_clear", description="Supprimer tous les filtres de ce salon")
+@bot.tree.command(name="vinted_clear", description="Vider le salon")
 async def clear_filters(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.manage_channels:
-        await interaction.response.send_message("❌ Tu dois avoir la permission de gérer les salons.", ephemeral=True)
-        return
-
     await bot.db.execute("DELETE FROM filters WHERE channel_id = ?", (interaction.channel_id,))
     await bot.db.commit()
-    await interaction.response.send_message("🗑️ Tous les filtres de ce salon ont été supprimés.")
+    await interaction.response.send_message("🗑️ Salon nettoyé.")
 
 if __name__ == "__main__":
-    if TOKEN:
-        bot.run(TOKEN)
-    else:
-        logging.critical("Impossible de lancer le bot sans Token.")
+    bot.run(TOKEN)
