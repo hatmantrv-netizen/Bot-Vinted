@@ -7,10 +7,9 @@ from discord.ext import tasks
 import logging
 from datetime import datetime
 import os
-from dotenv import load_dotenv
 
 # --- INITIALISATION & CONFIGURATION ---
-load_dotenv()
+
 TOKEN = os.getenv("TOKEN")
 CHECK_INTERVAL = 30  
 DB_NAME = "vinted_bot_v2.db" # On garde la même DB pour les filtres
