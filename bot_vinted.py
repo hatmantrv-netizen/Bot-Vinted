@@ -7,11 +7,13 @@ from discord.ext import tasks
 import logging
 from datetime import datetime
 import os
+from dotenv import load_dotenv
 
 # --- INITIALISATION & CONFIGURATION ---
+load_dotenv()
 TOKEN = os.getenv("TOKEN")
 CHECK_INTERVAL = 30  
-DB_NAME = "vinted_bot_v2.db"
+DB_NAME = "vinted_bot_v2.db" # On garde la même DB pour les filtres
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -134,8 +136,16 @@ class VintedBot(discord.Client):
                         price_txt = f"**{p:.2f} {currency}**\n*(TTC: {ttc:.2f} {currency})*"
                     except: price_txt = f"**{price_val} {currency}**"
 
-                    # --- CONSTRUCTION EMBED ---
-                    embed = discord.Embed(title=item.get('title'), url=f"https://www.vinted.fr/items/{item_id}", color=0x09B0B0, timestamp=datetime.now())
+                    # 4. Galerie d'images
+                    images = item.get('photos', [])
+                    main_photo = images[0]['url'] if images else item.get('photo', {}).get('url')
+                    item_url = f"https://www.vinted.fr/items/{item_id}"
+
+                    # --- CONSTRUCTION DES EMBEDS (GALERIE) ---
+                    embeds = []
+                    
+                    # Embed Principal (avec toutes les infos)
+                    embed = discord.Embed(title=item.get('title'), url=item_url, color=0x09B0B0, timestamp=datetime.now())
                     embed.add_field(name="⌛ Publié", value=published_at, inline=True)
                     embed.add_field(name="📕 Marque", value=item.get('brand_title', 'N/A'), inline=True)
                     embed.add_field(name="📏 Taille", value=item.get('size_title', 'N/A'), inline=True)
@@ -143,14 +153,24 @@ class VintedBot(discord.Client):
                     embed.add_field(name="💎 État", value=item.get('status_title', 'N/A'), inline=True)
                     embed.add_field(name="💰 Prix", value=price_txt, inline=True)
                     
-                    if item.get('photo', {}).get('url'):
-                        embed.set_image(url=item['photo']['url'])
+                    if main_photo:
+                        embed.set_image(url=main_photo)
                     
                     embed.set_author(name=f"Vendeur : {user.get('login', 'Inconnu')}")
-                    embed.set_footer(text=f"Filtre : {name}") # "Vintra" supprimé ici
+                    embed.set_footer(text=f"Filtre : {name}")
+                    embeds.append(embed)
 
-                    view = VintedItemView(f"https://www.vinted.fr/items/{item_id}", f"https://www.vinted.fr/messages/new?item_id={item_id}")
-                    await channel.send(embed=embed, view=view)
+                    # Embeds supplémentaires (images cachées pour créer la grille)
+                    # On en prend jusqu'à 3 autres pour faire une grille de 4 total maximum
+                    for img in images[1:4]:
+                        e = discord.Embed(url=item_url)
+                        e.set_image(url=img['url'])
+                        embeds.append(e)
+
+                    view = VintedItemView(item_url, f"https://www.vinted.fr/messages/new?item_id={item_id}")
+                    
+                    # On envoie la liste complète des embeds
+                    await channel.send(embeds=embeds, view=view)
                     await asyncio.sleep(0.5)
 
         except Exception as e:
@@ -159,7 +179,7 @@ class VintedBot(discord.Client):
 # --- COMMANDES ---
 bot = VintedBot()
 
-@bot.tree.command(name="vinted_add", description="Ajouter un filtre")
+@bot.tree.command(name="vinted_add", description="Ajouter un filtre Vinted")
 async def add_filter(interaction: discord.Interaction, nom_du_filtre: str, url_vinted: str):
     if "vinted.fr" not in url_vinted:
         return await interaction.response.send_message("❌ URL invalide", ephemeral=True)
@@ -170,7 +190,7 @@ async def add_filter(interaction: discord.Interaction, nom_du_filtre: str, url_v
     await bot.db.commit()
     await interaction.response.send_message(f"✅ Filtre '**{nom_du_filtre}**' ajouté !")
 
-@bot.tree.command(name="vinted_clear", description="Vider le salon")
+@bot.tree.command(name="vinted_clear", description="Vider le salon des filtres")
 async def clear_filters(interaction: discord.Interaction):
     await bot.db.execute("DELETE FROM filters WHERE channel_id = ?", (interaction.channel_id,))
     await bot.db.commit()
